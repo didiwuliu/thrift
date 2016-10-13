@@ -17,8 +17,10 @@
 # under the License.
 #
 
+SUBDIRS = .
+
 if WITH_TESTS
-SUBDIRS = test
+SUBDIRS += test
 endif
 
 install:
@@ -31,7 +33,10 @@ install:
 check-local:
 	$(GO) test ./thrift
 
-all-local: check-local
+all-local:
+	$(GO) build ./thrift
 
 EXTRA_DIST = \
-	thrift
+	thrift \
+	coding_standards.md \
+	README.md

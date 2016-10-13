@@ -17,36 +17,74 @@
 # under the License.
 #
 
-SUBDIRS =
+SUBDIRS = features
+PRECROSS_TARGET =
+
+if WITH_C_GLIB
+SUBDIRS += c_glib
+PRECROSS_TARGET += precross-c_glib
+endif
+
+if WITH_MONO
+SUBDIRS += csharp
+PRECROSS_TARGET += precross-csharp
+endif
 
 if WITH_CPP
 SUBDIRS += cpp
+PRECROSS_TARGET += precross-cpp
 endif
 
 if WITH_PERL
 SUBDIRS += perl
+PRECROSS_TARGET += precross-perl
 endif
 
 if WITH_PHP
 SUBDIRS += php
+PRECROSS_TARGET += precross-php
+endif
+
+if WITH_DART
+SUBDIRS += dart
+PRECROSS_TARGET += precross-dart
 endif
 
 if WITH_PYTHON
 SUBDIRS += py
-SUBDIRS += py.twisted
+PRECROSS_TARGET += precross-py
 SUBDIRS += py.tornado
+if WITH_TWISTED_TEST
+SUBDIRS += py.twisted
+endif
 endif
 
 if WITH_RUBY
 SUBDIRS += rb
+PRECROSS_TARGET += precross-rb
 endif
 
 if WITH_HASKELL
 SUBDIRS += hs
 endif
 
+if WITH_HAXE
+SUBDIRS += haxe
+endif
+
 if WITH_GO
 SUBDIRS += go
+PRECROSS_TARGET += precross-go
+endif
+
+if WITH_ERLANG
+SUBDIRS += erl
+PRECROSS_TARGET += precross-erl
+endif
+
+if WITH_LUA
+SUBDIRS += lua
+PRECROSS_TARGET += precross-lua
 endif
 
 #
@@ -55,10 +93,19 @@ endif
 check-local:
 	$(top_builddir)/compiler/cpp/thrift --gen html -r $(top_srcdir)/test/ThriftTest.thrift
 
+clean-local:
+	rm -rf $(top_srcdir)/test/gen-html
+
 EXTRA_DIST = \
-	test.sh \
+	audit \
+	crossrunner \
+	keys \
+	c_glib \
 	cpp \
+	dart \
+	erl \
 	hs \
+	lua \
 	ocaml \
 	perl \
 	php \
@@ -73,12 +120,30 @@ EXTRA_DIST = \
 	DebugProtoTest.thrift \
 	DenseLinkingTest.thrift \
 	DocTest.thrift \
+	EnumTest.thrift \
+	FullCamelTest.thrift \
 	Include.thrift \
 	JavaBeansTest.thrift \
+	JsDeepConstructorTest.thrift \
 	ManyOptionals.thrift \
 	ManyTypedefs.thrift \
+	NameConflictTest.thrift \
 	OptionalRequiredTest.thrift \
+	Recursive.thrift \
+	ReuseObjects.thrift \
 	SmallTest.thrift \
 	StressTest.thrift \
 	ThriftTest.thrift \
-	FastbinaryTest.py
+	TypedefTest.thrift \
+	known_failures_Linux.json \
+	test.py \
+	tests.json \
+	rebuild_known_failures.sh \
+	result.js \
+	index.html \
+	README.md \
+	valgrind.suppress
+
+precross-%:
+	$(MAKE) -C $* precross
+precross: $(PRECROSS_TARGET)

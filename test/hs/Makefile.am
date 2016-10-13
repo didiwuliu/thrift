@@ -17,14 +17,27 @@
 # under the License.
 #
 
-THRIFT = $(top_srcdir)/compiler/cpp/thrift
+THRIFT = $(top_builddir)/compiler/cpp/thrift
 
-stubs: ../ConstantsDemo.thrift ../DebugProtoTest.thrift ../ThriftTest.thrift
+stubs: $(THRIFT) ../ConstantsDemo.thrift ../DebugProtoTest.thrift ../ThriftTest.thrift ../Include.thrift
 	$(THRIFT) --gen hs ../ConstantsDemo.thrift
 	$(THRIFT) --gen hs ../DebugProtoTest.thrift
 	$(THRIFT) --gen hs ../ThriftTest.thrift
+	$(THRIFT) --gen hs ../Include.thrift
 
 check: stubs
 	sh run-test.sh ConstantsDemo
 	sh run-test.sh DebugProtoTest
 	sh run-test.sh ThriftTest
+	sh run-test.sh Include
+
+clean-local:
+	$(RM) -r gen-hs
+	$(RM) *.hi
+	$(RM) *.o
+
+all-local: stubs
+	ghc -igen-hs TestServer.hs
+	ghc -igen-hs TestClient.hs
+
+precross: all-local

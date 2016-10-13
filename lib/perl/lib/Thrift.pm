@@ -17,6 +17,8 @@
 # under the License.
 #
 
+package Thrift;
+
 our $VERSION = '1.0.0-dev';
 
 require 5.6.0;
@@ -58,6 +60,15 @@ use constant ONEWAY    => 4;
 
 package Thrift::TException;
 
+use overload '""' => sub {
+    return
+          ref( $_[0] )
+        . " error: "
+        . ( $_[0]->{message} || 'empty message' )
+        . " (code "
+        . ( defined $_[0]->{code} ? $_[0]->{code} : 'undefined' ) . ")";
+    };
+
 sub new {
     my $classname = shift;
     my $self = {message => shift, code => shift || 0};
@@ -84,7 +95,7 @@ use constant UNSUPPORTED_CLIENT_TYPE => 10;
 sub new {
     my $classname = shift;
 
-    my $self = $classname->SUPER::new();
+    my $self = $classname->SUPER::new(@_);
 
     return bless($self,$classname);
 }

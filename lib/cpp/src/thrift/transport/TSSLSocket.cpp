@@ -28,6 +28,14 @@
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
+#ifdef HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
+#ifdef HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
+
+
 #include <boost/lexical_cast.hpp>
 #include <boost/shared_array.hpp>
 #include <openssl/err.h>
@@ -47,8 +55,98 @@ struct CRYPTO_dynlock_value {
   Mutex mutex;
 };
 
-namespace apache { namespace thrift { namespace transport {
+namespace apache {
+namespace thrift {
+namespace transport {
 
+// OpenSSL initialization/cleanup
+
+static bool openSSLInitialized = false;
+static boost::shared_array<Mutex> mutexes;
+
+static void callbackLocking(int mode, int n, const char*, int) {
+  if (mode & CRYPTO_LOCK) {
+    mutexes[n].lock();
+  } else {
+    mutexes[n].unlock();
+  }
+}
+
+#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
+static unsigned long callbackThreadID() {
+#ifdef _WIN32
+  return (unsigned long)GetCurrentThreadId();
+#else
+  return (unsigned long)pthread_self();
+#endif
+}
+#endif
+
+static CRYPTO_dynlock_value* dyn_create(const char*, int) {
+  return new CRYPTO_dynlock_value;
+}
+
+static void dyn_lock(int mode, struct CRYPTO_dynlock_value* lock, const char*, int) {
+  if (lock != NULL) {
+    if (mode & CRYPTO_LOCK) {
+      lock->mutex.lock();
+    } else {
+      lock->mutex.unlock();
+    }
+  }
+}
+
+static void dyn_destroy(struct CRYPTO_dynlock_value* lock, const char*, int) {
+  delete lock;
+}
+
+void initializeOpenSSL() {
+  if (openSSLInitialized) {
+    return;
+  }
+  openSSLInitialized = true;
+  SSL_library_init();
+  SSL_load_error_strings();
+  // static locking
+  // newer versions of OpenSSL changed CRYPTO_num_locks - see THRIFT-3878
+#ifdef CRYPTO_num_locks
+  mutexes = boost::shared_array<Mutex>(new Mutex[CRYPTO_num_locks()]);
+#else
+  mutexes = boost::shared_array<Mutex>(new Mutex[ ::CRYPTO_num_locks()]);
+#endif
+  if (mutexes == NULL) {
+    throw TTransportException(TTransportException::INTERNAL_ERROR,
+                              "initializeOpenSSL() failed, "
+                              "out of memory while creating mutex array");
+  }
+#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
+  CRYPTO_set_id_callback(callbackThreadID);
+#endif
+  CRYPTO_set_locking_callback(callbackLocking);
+  // dynamic locking
+  CRYPTO_set_dynlock_create_callback(dyn_create);
+  CRYPTO_set_dynlock_lock_callback(dyn_lock);
+  CRYPTO_set_dynlock_destroy_callback(dyn_destroy);
+}
+
+void cleanupOpenSSL() {
+  if (!openSSLInitialized) {
+    return;
+  }
+  openSSLInitialized = false;
+#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
+  CRYPTO_set_id_callback(NULL);
+#endif
+  CRYPTO_set_locking_callback(NULL);
+  CRYPTO_set_dynlock_create_callback(NULL);
+  CRYPTO_set_dynlock_lock_callback(NULL);
+  CRYPTO_set_dynlock_destroy_callback(NULL);
+  ERR_free_strings();
+  EVP_cleanup();
+  CRYPTO_cleanup_all_ex_data();
+  ERR_remove_state(0);
+  mutexes.reset();
+}
 
 static void buildErrors(string& message, int error = 0);
 static bool matchName(const char* host, const char* pattern, int size);
@@ -56,28 +154,19 @@ static char uppercase(char c);
 
 // SSLContext implementation
 SSLContext::SSLContext(const SSLProtocol& protocol) {
-  if(protocol == SSLTLS)
-  {
+  if (protocol == SSLTLS) {
     ctx_ = SSL_CTX_new(SSLv23_method());
-  }
-  else if(protocol == SSLv3)
-  {
+#ifndef OPENSSL_NO_SSL3
+  } else if (protocol == SSLv3) {
     ctx_ = SSL_CTX_new(SSLv3_method());
-  }
-  else if(protocol == TLSv1_0)
-  {
+#endif
+  } else if (protocol == TLSv1_0) {
     ctx_ = SSL_CTX_new(TLSv1_method());
-  }
-  else if(protocol == TLSv1_1)
-  {
+  } else if (protocol == TLSv1_1) {
     ctx_ = SSL_CTX_new(TLSv1_1_method());
-  }
-  else if(protocol == TLSv1_2)
-  {
+  } else if (protocol == TLSv1_2) {
     ctx_ = SSL_CTX_new(TLSv1_2_method());
-  }
-  else
-  {
+  } else {
     /// UNKNOWN PROTOCOL!
     throw TSSLException("SSL_CTX_new: Unknown protocol");
   }
@@ -89,10 +178,11 @@ SSLContext::SSLContext(const SSLProtocol& protocol) {
   }
   SSL_CTX_set_mode(ctx_, SSL_MODE_AUTO_RETRY);
 
-  // Disable horribly insecure SSLv2!
-  if(protocol == SSLTLS)
-  {
-    SSL_CTX_set_options(ctx_, SSL_OP_NO_SSLv2);
+  // Disable horribly insecure SSLv2 and SSLv3 protocols but allow a handshake
+  // with older clients so they get a graceful denial.
+  if (protocol == SSLTLS) {
+      SSL_CTX_set_options(ctx_, SSL_OP_NO_SSLv2);
+      SSL_CTX_set_options(ctx_, SSL_OP_NO_SSLv3);   // THRIFT-3164
   }
 }
 
@@ -114,16 +204,30 @@ SSL* SSLContext::createSSL() {
 }
 
 // TSSLSocket implementation
-TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx):
-  TSocket(), server_(false), ssl_(NULL), ctx_(ctx) {
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx)
+  : TSocket(), server_(false), ssl_(NULL), ctx_(ctx) {
 }
 
-TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, THRIFT_SOCKET socket):
-  TSocket(socket), server_(false), ssl_(NULL), ctx_(ctx) {
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
+        : TSocket(), server_(false), ssl_(NULL), ctx_(ctx) {
+  interruptListener_ = interruptListener;
 }
 
-TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, string host, int port):
-  TSocket(host, port), server_(false), ssl_(NULL), ctx_(ctx) {
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, THRIFT_SOCKET socket)
+  : TSocket(socket), server_(false), ssl_(NULL), ctx_(ctx) {
+}
+
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, THRIFT_SOCKET socket, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
+        : TSocket(socket, interruptListener), server_(false), ssl_(NULL), ctx_(ctx) {
+}
+
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, string host, int port)
+  : TSocket(host, port), server_(false), ssl_(NULL), ctx_(ctx) {
+}
+
+TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, string host, int port, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
+        : TSocket(host, port), server_(false), ssl_(NULL), ctx_(ctx) {
+  interruptListener_ = interruptListener;
 }
 
 TSSLSocket::~TSSLSocket() {
@@ -135,9 +239,9 @@ bool TSSLSocket::isOpen() {
     return false;
   }
   int shutdown = SSL_get_shutdown(ssl_);
-  // "!!" is squelching C4800 "forcing bool -> true or false" perfomance warning
+  // "!!" is squelching C4800 "forcing bool -> true or false" performance warning
   bool shutdownReceived = !!(shutdown & SSL_RECEIVED_SHUTDOWN);
-  bool shutdownSent     = !!(shutdown & SSL_SENT_SHUTDOWN);
+  bool shutdownSent = !!(shutdown & SSL_SENT_SHUTDOWN);
   if (shutdownReceived && shutdownSent) {
     return false;
   }
@@ -151,16 +255,32 @@ bool TSSLSocket::peek() {
   checkHandshake();
   int rc;
   uint8_t byte;
-  rc = SSL_peek(ssl_, &byte, 1);
-  if (rc < 0) {
-    int errno_copy = THRIFT_GET_SOCKET_ERROR;
-    string errors;
-    buildErrors(errors, errno_copy);
-    throw TSSLException("SSL_peek: " + errors);
-  }
-  if (rc == 0) {
-    ERR_clear_error();
-  }
+  do {
+    rc = SSL_peek(ssl_, &byte, 1);
+    if (rc < 0) {
+
+      int errno_copy = THRIFT_GET_SOCKET_ERROR;
+      int error = SSL_get_error(ssl_, rc);
+      switch (error) {
+        case SSL_ERROR_SYSCALL:
+          if ((errno_copy != THRIFT_EINTR)
+              && (errno_copy != THRIFT_EAGAIN)) {
+            break;
+          }
+        case SSL_ERROR_WANT_READ:
+        case SSL_ERROR_WANT_WRITE:
+          waitForEvent(error == SSL_ERROR_WANT_READ);
+              continue;
+        default:;// do nothing
+      }
+      string errors;
+      buildErrors(errors, errno_copy);
+      throw TSSLException("SSL_peek: " + errors);
+    } else if (rc == 0) {
+      ERR_clear_error();
+      break;
+    }
+  } while (true);
   return (rc > 0);
 }
 
@@ -173,10 +293,28 @@ void TSSLSocket::open() {
 
 void TSSLSocket::close() {
   if (ssl_ != NULL) {
-    int rc = SSL_shutdown(ssl_);
-    if (rc == 0) {
+    int rc;
+
+    do {
       rc = SSL_shutdown(ssl_);
-    }
+      if (rc <= 0) {
+        int errno_copy = THRIFT_GET_SOCKET_ERROR;
+        int error = SSL_get_error(ssl_, rc);
+        switch (error) {
+          case SSL_ERROR_SYSCALL:
+            if ((errno_copy != THRIFT_EINTR)
+                && (errno_copy != THRIFT_EAGAIN)) {
+              break;
+            }
+          case SSL_ERROR_WANT_READ:
+          case SSL_ERROR_WANT_WRITE:
+            waitForEvent(error == SSL_ERROR_WANT_READ);
+                rc = 2;
+          default:;// do nothing
+        }
+      }
+    } while (rc == 2);
+
     if (rc < 0) {
       int errno_copy = THRIFT_GET_SOCKET_ERROR;
       string errors;
@@ -193,15 +331,37 @@ void TSSLSocket::close() {
 uint32_t TSSLSocket::read(uint8_t* buf, uint32_t len) {
   checkHandshake();
   int32_t bytes = 0;
-  for (int32_t retries = 0; retries < maxRecvRetries_; retries++){
+  for (int32_t retries = 0; retries < maxRecvRetries_; retries++) {
+    ERR_clear_error();
     bytes = SSL_read(ssl_, buf, len);
     if (bytes >= 0)
       break;
-    int errno_copy = THRIFT_GET_SOCKET_ERROR;
-    if (SSL_get_error(ssl_, bytes) == SSL_ERROR_SYSCALL) {
-      if (ERR_get_error() == 0 && errno_copy == THRIFT_EINTR) {
+    int32_t errno_copy = THRIFT_GET_SOCKET_ERROR;
+    int32_t error = SSL_get_error(ssl_, bytes);
+    switch (error) {
+      case SSL_ERROR_SYSCALL:
+        if ((errno_copy != THRIFT_EINTR)
+            && (errno_copy != THRIFT_EAGAIN)) {
+              break;
+        }
+        if (retries++ >= maxRecvRetries_) {
+          // THRIFT_EINTR needs to be handled manually and we can tolerate
+          // a certain number
+          break;
+        }
+      case SSL_ERROR_WANT_READ:
+      case SSL_ERROR_WANT_WRITE:
+        if (waitForEvent(error == SSL_ERROR_WANT_READ) == TSSL_EINTR ) {
+          // repeat operation
+          if (retries++ < maxRecvRetries_) {
+            // THRIFT_EINTR needs to be handled manually and we can tolerate
+            // a certain number
+            continue;
+          }
+          throw TTransportException(TTransportException::INTERNAL_ERROR, "too much recv retries");
+        }
         continue;
-      }
+      default:;// do nothing
     }
     string errors;
     buildErrors(errors, errno_copy);
@@ -215,9 +375,23 @@ void TSSLSocket::write(const uint8_t* buf, uint32_t len) {
   // loop in case SSL_MODE_ENABLE_PARTIAL_WRITE is set in SSL_CTX.
   uint32_t written = 0;
   while (written < len) {
+    ERR_clear_error();
     int32_t bytes = SSL_write(ssl_, &buf[written], len - written);
     if (bytes <= 0) {
       int errno_copy = THRIFT_GET_SOCKET_ERROR;
+      int error = SSL_get_error(ssl_, bytes);
+      switch (error) {
+        case SSL_ERROR_SYSCALL:
+          if ((errno_copy != THRIFT_EINTR)
+              && (errno_copy != THRIFT_EAGAIN)) {
+            break;
+          }
+        case SSL_ERROR_WANT_READ:
+        case SSL_ERROR_WANT_WRITE:
+          waitForEvent(error == SSL_ERROR_WANT_READ);
+          continue;
+        default:;// do nothing
+      }
       string errors;
       buildErrors(errors, errno_copy);
       throw TSSLException("SSL_write: " + errors);
@@ -251,13 +425,78 @@ void TSSLSocket::checkHandshake() {
   if (ssl_ != NULL) {
     return;
   }
+
+  // set underlying socket to non-blocking
+  int flags;
+  if ((flags = THRIFT_FCNTL(socket_, THRIFT_F_GETFL, 0)) < 0
+      || THRIFT_FCNTL(socket_, THRIFT_F_SETFL, flags | THRIFT_O_NONBLOCK) < 0) {
+    GlobalOutput.perror("thriftServerEventHandler: set THRIFT_O_NONBLOCK (THRIFT_FCNTL) ",
+                        THRIFT_GET_SOCKET_ERROR);
+    ::THRIFT_CLOSESOCKET(socket_);
+    return;
+  }
+
   ssl_ = ctx_->createSSL();
-  SSL_set_fd(ssl_, socket_);
+
+  //set read and write bios to non-blocking
+  BIO* wbio =  BIO_new(BIO_s_mem());
+  if (wbio == NULL) {
+    throw TSSLException("SSL_get_wbio returns NULL");
+  }
+  BIO_set_nbio(wbio, 1);
+
+  BIO* rbio = BIO_new(BIO_s_mem());
+  if (rbio == NULL) {
+    throw TSSLException("SSL_get_rbio returns NULL");
+  }
+  BIO_set_nbio(rbio, 1);
+
+  SSL_set_bio(ssl_, rbio, wbio);
+
+  SSL_set_fd(ssl_, static_cast<int>(socket_));
   int rc;
   if (server()) {
-    rc = SSL_accept(ssl_);
+    do {
+      rc = SSL_accept(ssl_);
+      if (rc <= 0) {
+        int errno_copy = THRIFT_GET_SOCKET_ERROR;
+        int error = SSL_get_error(ssl_, rc);
+        switch (error) {
+          case SSL_ERROR_SYSCALL:
+            if ((errno_copy != THRIFT_EINTR)
+                && (errno_copy != THRIFT_EAGAIN)) {
+              break;
+            }
+          case SSL_ERROR_WANT_READ:
+          case SSL_ERROR_WANT_WRITE:
+            waitForEvent(error == SSL_ERROR_WANT_READ);
+            rc = 2;
+          default:;// do nothing
+        }
+      }
+    } while (rc == 2);
   } else {
-    rc = SSL_connect(ssl_);
+    // set the SNI hostname
+    SSL_set_tlsext_host_name(ssl_, getHost().c_str());
+    do {
+      rc = SSL_connect(ssl_);
+      if (rc <= 0) {
+        int errno_copy = THRIFT_GET_SOCKET_ERROR;
+        int error = SSL_get_error(ssl_, rc);
+        switch (error) {
+          case SSL_ERROR_SYSCALL:
+            if ((errno_copy != THRIFT_EINTR)
+                && (errno_copy != THRIFT_EAGAIN)) {
+              break;
+            }
+          case SSL_ERROR_WANT_READ:
+          case SSL_ERROR_WANT_WRITE:
+            waitForEvent(error == SSL_ERROR_WANT_READ);
+                rc = 2;
+          default:;// do nothing
+        }
+      }
+    } while (rc == 2);
   }
   if (rc <= 0) {
     int errno_copy = THRIFT_GET_SOCKET_ERROR;
@@ -271,9 +510,8 @@ void TSSLSocket::checkHandshake() {
 
 void TSSLSocket::authorize() {
   int rc = SSL_get_verify_result(ssl_);
-  if (rc != X509_V_OK) {  // verify authentication result
-    throw TSSLException(string("SSL_get_verify_result(), ") +
-                        X509_verify_cert_error_string(rc));
+  if (rc != X509_V_OK) { // verify authentication result
+    throw TSSLException(string("SSL_get_verify_result(), ") + X509_verify_cert_error_string(rc));
   }
 
   X509* cert = SSL_get_peer_certificate(ssl_);
@@ -314,8 +552,8 @@ void TSSLSocket::authorize() {
   }
 
   // extract subjectAlternativeName
-  STACK_OF(GENERAL_NAME)* alternatives = (STACK_OF(GENERAL_NAME)*)
-                       X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+  STACK_OF(GENERAL_NAME)* alternatives
+      = (STACK_OF(GENERAL_NAME)*)X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
   if (alternatives != NULL) {
     const int count = sk_GENERAL_NAME_num(alternatives);
     for (int i = 0; decision == AccessManager::SKIP && i < count; i++) {
@@ -326,15 +564,15 @@ void TSSLSocket::authorize() {
       char* data = (char*)ASN1_STRING_data(name->d.ia5);
       int length = ASN1_STRING_length(name->d.ia5);
       switch (name->type) {
-        case GEN_DNS:
-          if (host.empty()) {
-            host = (server() ? getPeerHost() : getHost());
-          }
-          decision = access_->verify(host, data, length);
-          break;
-        case GEN_IPADD:
-          decision = access_->verify(sa, data, length);
-          break;
+      case GEN_DNS:
+        if (host.empty()) {
+          host = (server() ? getPeerHost() : getHost());
+        }
+        decision = access_->verify(host, data, length);
+        break;
+      case GEN_IPADD:
+        decision = access_->verify(sa, data, length);
+        break;
       }
     }
     sk_GENERAL_NAME_pop_free(alternatives, GENERAL_NAME_free);
@@ -364,7 +602,7 @@ void TSSLSocket::authorize() {
       ASN1_STRING* common = X509_NAME_ENTRY_get_data(entry);
       int size = ASN1_STRING_to_UTF8(&utf8, common);
       if (host.empty()) {
-        host = (server() ? getHost() : getHost());
+        host = (server() ? getPeerHost() : getHost());
       }
       decision = access_->verify(host, (char*)utf8, size);
       OPENSSL_free(utf8);
@@ -376,15 +614,65 @@ void TSSLSocket::authorize() {
   }
 }
 
-// TSSLSocketFactory implementation
-bool     TSSLSocketFactory::initialized = false;
-uint64_t TSSLSocketFactory::count_ = 0;
-Mutex    TSSLSocketFactory::mutex_;
+unsigned int TSSLSocket::waitForEvent(bool wantRead) {
+  int fdSocket;
+  BIO* bio;
 
-TSSLSocketFactory::TSSLSocketFactory(const SSLProtocol& protocol): server_(false) {
+  if (wantRead) {
+    bio = SSL_get_rbio(ssl_);
+  } else {
+    bio = SSL_get_wbio(ssl_);
+  }
+
+  if (bio == NULL) {
+    throw TSSLException("SSL_get_?bio returned NULL");
+  }
+
+  if (BIO_get_fd(bio, &fdSocket) <= 0) {
+    throw TSSLException("BIO_get_fd failed");
+  }
+
+  struct THRIFT_POLLFD fds[2];
+  std::memset(fds, 0, sizeof(fds));
+  fds[0].fd = fdSocket;
+  fds[0].events = wantRead ? THRIFT_POLLIN : THRIFT_POLLOUT;
+
+  if (interruptListener_) {
+    fds[1].fd = *(interruptListener_.get());
+    fds[1].events = THRIFT_POLLIN;
+  }
+
+  int ret = THRIFT_POLL(fds, interruptListener_ ? 2 : 1, -1);
+
+  if (ret < 0) {
+    // error cases
+    if (THRIFT_GET_SOCKET_ERROR == THRIFT_EINTR) {
+      return TSSL_EINTR; // repeat operation
+    }
+    int errno_copy = THRIFT_GET_SOCKET_ERROR;
+    GlobalOutput.perror("TSSLSocket::read THRIFT_POLL() ", errno_copy);
+    throw TTransportException(TTransportException::UNKNOWN, "Unknown", errno_copy);
+  } else if (ret > 0){
+    if (fds[1].revents & THRIFT_POLLIN) {
+      throw TTransportException(TTransportException::INTERRUPTED, "Interrupted");
+    }
+    return TSSL_DATA;
+  } else {
+    throw TTransportException(TTransportException::TIMED_OUT, "THRIFT_POLL (timed out)");
+  }
+}
+
+// TSSLSocketFactory implementation
+uint64_t TSSLSocketFactory::count_ = 0;
+Mutex TSSLSocketFactory::mutex_;
+bool TSSLSocketFactory::manualOpenSSLInitialization_ = false;
+
+TSSLSocketFactory::TSSLSocketFactory(SSLProtocol protocol) : server_(false) {
   Guard guard(mutex_);
   if (count_ == 0) {
-    initializeOpenSSL();
+    if (!manualOpenSSLInitialization_) {
+      initializeOpenSSL();
+    }
     randomize();
   }
   count_++;
@@ -395,7 +683,7 @@ TSSLSocketFactory::~TSSLSocketFactory() {
   Guard guard(mutex_);
   ctx_.reset();
   count_--;
-  if (count_ == 0) {
+  if (count_ == 0 && !manualOpenSSLInitialization_) {
     cleanupOpenSSL();
   }
 }
@@ -406,18 +694,36 @@ boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket() {
   return ssl;
 }
 
+boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(boost::shared_ptr<THRIFT_SOCKET> interruptListener) {
+  boost::shared_ptr<TSSLSocket> ssl(new TSSLSocket(ctx_, interruptListener));
+  setup(ssl);
+  return ssl;
+}
+
 boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(THRIFT_SOCKET socket) {
   boost::shared_ptr<TSSLSocket> ssl(new TSSLSocket(ctx_, socket));
   setup(ssl);
   return ssl;
 }
 
-boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(const string& host,
-                                                       int port) {
+boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(THRIFT_SOCKET socket, boost::shared_ptr<THRIFT_SOCKET> interruptListener) {
+  boost::shared_ptr<TSSLSocket> ssl(new TSSLSocket(ctx_, socket, interruptListener));
+  setup(ssl);
+  return ssl;
+}
+
+boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(const string& host, int port) {
   boost::shared_ptr<TSSLSocket> ssl(new TSSLSocket(ctx_, host, port));
   setup(ssl);
   return ssl;
 }
+
+boost::shared_ptr<TSSLSocket> TSSLSocketFactory::createSocket(const string& host, int port, boost::shared_ptr<THRIFT_SOCKET> interruptListener) {
+  boost::shared_ptr<TSSLSocket> ssl(new TSSLSocket(ctx_, host, port, interruptListener));
+  setup(ssl);
+  return ssl;
+}
+
 
 void TSSLSocketFactory::setup(boost::shared_ptr<TSSLSocket> ssl) {
   ssl->server(server());
@@ -444,7 +750,7 @@ void TSSLSocketFactory::ciphers(const string& enable) {
 void TSSLSocketFactory::authenticate(bool required) {
   int mode;
   if (required) {
-    mode  = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT | SSL_VERIFY_CLIENT_ONCE;
+    mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT | SSL_VERIFY_CLIENT_ONCE;
   } else {
     mode = SSL_VERIFY_NONE;
   }
@@ -454,7 +760,7 @@ void TSSLSocketFactory::authenticate(bool required) {
 void TSSLSocketFactory::loadCertificate(const char* path, const char* format) {
   if (path == NULL || format == NULL) {
     throw TTransportException(TTransportException::BAD_ARGS,
-         "loadCertificateChain: either <path> or <format> is NULL");
+                              "loadCertificateChain: either <path> or <format> is NULL");
   }
   if (strcmp(format, "PEM") == 0) {
     if (SSL_CTX_use_certificate_chain_file(ctx_->get(), path) == 0) {
@@ -471,7 +777,7 @@ void TSSLSocketFactory::loadCertificate(const char* path, const char* format) {
 void TSSLSocketFactory::loadPrivateKey(const char* path, const char* format) {
   if (path == NULL || format == NULL) {
     throw TTransportException(TTransportException::BAD_ARGS,
-         "loadPrivateKey: either <path> or <format> is NULL");
+                              "loadPrivateKey: either <path> or <format> is NULL");
   }
   if (strcmp(format, "PEM") == 0) {
     if (SSL_CTX_use_PrivateKey_file(ctx_->get(), path, SSL_FILETYPE_PEM) == 0) {
@@ -486,7 +792,7 @@ void TSSLSocketFactory::loadPrivateKey(const char* path, const char* format) {
 void TSSLSocketFactory::loadTrustedCertificates(const char* path) {
   if (path == NULL) {
     throw TTransportException(TTransportException::BAD_ARGS,
-         "loadTrustedCertificates: <path> is NULL");
+                              "loadTrustedCertificates: <path> is NULL");
   }
   if (SSL_CTX_load_verify_locations(ctx_->get(), path, NULL) == 0) {
     int errno_copy = THRIFT_GET_SOCKET_ERROR;
@@ -505,104 +811,23 @@ void TSSLSocketFactory::overrideDefaultPasswordCallback() {
   SSL_CTX_set_default_passwd_cb_userdata(ctx_->get(), this);
 }
 
-int TSSLSocketFactory::passwordCallback(char* password,
-                                        int size,
-                                        int,
-                                        void* data) {
+int TSSLSocketFactory::passwordCallback(char* password, int size, int, void* data) {
   TSSLSocketFactory* factory = (TSSLSocketFactory*)data;
   string userPassword;
   factory->getPassword(userPassword, size);
-  int length = userPassword.size();
+  int length = static_cast<int>(userPassword.size());
   if (length > size) {
     length = size;
   }
   strncpy(password, userPassword.c_str(), length);
+  userPassword.assign(userPassword.size(), '*');
   return length;
-}
-
-static boost::shared_array<Mutex> mutexes;
-
-static void callbackLocking(int mode, int n, const char*, int) {
-  if (mode & CRYPTO_LOCK) {
-    mutexes[n].lock();
-  } else {
-    mutexes[n].unlock();
-  }
-}
-
-#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
-static unsigned long callbackThreadID() {
-  return (unsigned long) pthread_self();
-}
-#endif
-
-static CRYPTO_dynlock_value* dyn_create(const char*, int) {
-  return new CRYPTO_dynlock_value;
-}
-
-static void dyn_lock(int mode,
-                     struct CRYPTO_dynlock_value* lock,
-                     const char*, int) {
-  if (lock != NULL) {
-    if (mode & CRYPTO_LOCK) {
-      lock->mutex.lock();
-    } else {
-      lock->mutex.unlock();
-    }
-  }
-}
-
-static void dyn_destroy(struct CRYPTO_dynlock_value* lock, const char*, int) {
-  delete lock;
-}
-
-void TSSLSocketFactory::initializeOpenSSL() {
-  if (initialized) {
-    return;
-  }
-  initialized = true;
-  SSL_library_init();
-  SSL_load_error_strings();
-  // static locking
-  mutexes = boost::shared_array<Mutex>(new Mutex[::CRYPTO_num_locks()]);
-  if (mutexes == NULL) {
-    throw TTransportException(TTransportException::INTERNAL_ERROR,
-          "initializeOpenSSL() failed, "
-          "out of memory while creating mutex array");
-  }
-#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
-  CRYPTO_set_id_callback(callbackThreadID);
-#endif
-  CRYPTO_set_locking_callback(callbackLocking);
-  // dynamic locking
-  CRYPTO_set_dynlock_create_callback(dyn_create);
-  CRYPTO_set_dynlock_lock_callback(dyn_lock);
-  CRYPTO_set_dynlock_destroy_callback(dyn_destroy);
-}
-
-void TSSLSocketFactory::cleanupOpenSSL() {
-  if (!initialized) {
-    return;
-  }
-  initialized = false;
-#if (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_NO_THREAD_ID)
-  CRYPTO_set_id_callback(NULL);
-#endif
-  CRYPTO_set_locking_callback(NULL);
-  CRYPTO_set_dynlock_create_callback(NULL);
-  CRYPTO_set_dynlock_lock_callback(NULL);
-  CRYPTO_set_dynlock_destroy_callback(NULL);
-  CRYPTO_cleanup_all_ex_data();
-  ERR_free_strings();
-  EVP_cleanup();
-  ERR_remove_state(0);
-  mutexes.reset();
 }
 
 // extract error messages from error queue
 void buildErrors(string& errors, int errno_copy) {
-  unsigned long  errorCode;
-  char   message[256];
+  unsigned long errorCode;
+  char message[256];
 
   errors.reserve(512);
   while ((errorCode = ERR_get_error()) != 0) {
@@ -629,9 +854,8 @@ void buildErrors(string& errors, int errno_copy) {
 /**
  * Default implementation of AccessManager
  */
-Decision DefaultClientAccessManager::verify(const sockaddr_storage& sa)
-  throw() {
-  (void) sa;
+Decision DefaultClientAccessManager::verify(const sockaddr_storage& sa) throw() {
+  (void)sa;
   return SKIP;
 }
 
@@ -687,16 +911,16 @@ bool matchName(const char* host, const char* pattern, int size) {
     match = true;
   }
   return match;
-
 }
 
 // This is to work around the Turkish locale issue, i.e.,
 // toupper('i') != toupper('I') if locale is "tr_TR"
-char uppercase (char c) {
+char uppercase(char c) {
   if ('a' <= c && c <= 'z') {
     return c + ('A' - 'a');
   }
   return c;
 }
-
-}}}
+}
+}
+}
